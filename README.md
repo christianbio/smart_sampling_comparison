@@ -153,3 +153,54 @@ This will:
   - Estimated equi-N baseline wall/CPU usage.  
   - Speedup factor of SMART vs baseline.  
   - Efficiency vs available cluster capacity.  
+
+## `make_timelines.py`
+
+Generate **xmgrace-friendly timelines** (Gantt-style segments) for both **sampling** and **clustering** jobs, using Slurm accounting data. Useful for visualizing campaign concurrency and run cadence on a shared time axis.
+
+### What it reads
+
+- `chemina.log` (to infer *t₀*, the campaign start time from the first timestamped line).
+- Job IDs scraped from:
+  - `log_dir/**/_submission.sh` (sampling jobs)
+  - `log_cluster/*_submission.sh` (clustering jobs)
+- Slurm accounting via `sacct` (requires Slurm environment and permission).
+
+### What it writes (to the run directory)
+
+- `sampling_timeline.dat` — line segments for sampling jobs  
+- `clustering_timeline.dat` — line segments for clustering jobs  
+- `timeline_row_map.tsv` — mapping of row indices to `(type, JobID, Start, End)`
+
+Each `*.dat` file contains blocks like:
+
+```
+<start_hours_since_t0>  <row_index>
+<end_hours_since_t0>    <row_index>
+```
+(blank line separates segments). This format plots nicely as line segments in xmgrace (or can be post-processed elsewhere).
+
+### Basic usage
+
+```bash
+python make_timelines.py .logs/chemina.log
+```
+
+By default, the script assumes the run directory is the parent of the log’s folder (i.e., .../<run>/.logs/chemina.log → run dir is .../<run>). You can override:
+
+```
+python make_timelines.py .logs/chemina.log \
+  --run-dir . \
+  --partition dev_sampling \
+  --start-date 2025-08-01 \
+  --end-date now
+  ```
+
+Or pin the zero-hour explicitly:
+
+```
+python make_timelines.py .logs/chemina.log \
+  --run-start "2025-08-12 09:30:00"
+  ```
+
+  
