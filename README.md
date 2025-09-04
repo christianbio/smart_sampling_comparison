@@ -34,6 +34,60 @@ This repository contains scripts to analyze **SMART** versus **NOSMART** samplin
 
 ## Typical Workflow
 
+0. Write metadata JSON  
+
+Before discovery tables can be populated, you need a `sampling_metadata.json` file
+that maps **case IDs** to their database paths. This metadata file is used by
+`populate_discovery_all.py` and `collate_class_discovery.py`.
+
+A helper script can be used to generate this file. For example:
+
+```python
+from chemina.sample.sample import Smart_sampling
+from chemina.conformers.conformers import ConformerCollection
+from chemina.repositories.conformer_database import Conformer_db
+import json
+
+conf_db = Conformer_db("mol22.db")
+mol_id = conf_db.query("select mol_id from molecule").fetchone()[0]
+confs = conf_db.read_to_conformercollection(mol_id)
+
+job_dict = {}
+space_groups = {sg: int(1e12) for sg in [1, 2, 4, 14]}  # example
+
+for conf in confs:
+    job_dict[conf.label] = {
+        "space_groups": space_groups,
+        "ids": [conf.label],
+    }
+
+smart_sampling = Smart_sampling(
+    conformer_collection_list=[confs],
+    job_dict=job_dict,
+    sample_dir="Sample",
+    cores_per_job=20,
+)
+
+metadata = {"db_path_dict": smart_sampling.db_path_dict}
+with open("sampling_metadata.json", "w") as f:
+    json.dump(metadata, f, indent=2)
+
+print("✅ Wrote sampling_metadata.json")
+
+This will create a JSON file like:
+
+```
+{
+  "db_path_dict": {
+    "mol22-44786623-2-1": "Sample/mol22-44786623-2/sg-1.db",
+    "mol22-44786623-2-2": "Sample/mol22-44786623-2/sg-2.db",
+    ...
+  }
+}
+```
+This file is required for downstream scripts.
+
+
 1. Combine SMART and NOSMART databases  
 
    Use `combine_db.py` to merge the outputs of SMART and NOSMART sampling runs into a single database with a consistent schema.  
@@ -203,4 +257,3 @@ python make_timelines.py .logs/chemina.log \
   --run-start "2025-08-12 09:30:00"
   ```
 
-  
