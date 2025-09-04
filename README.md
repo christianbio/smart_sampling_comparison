@@ -33,9 +33,11 @@ This repository contains scripts to analyze **SMART** versus **NOSMART** samplin
     ```
 
     where clustered_cases.db is the clustered output db from smart_sampling, and clustered_cases_combined.db is the 
-    clustered db from a reference 'no-smart' sampling run. 
+    clustered db from a reference 'no-smart' sampling run, where
 
-    This will create `clustered_cases_combined.db` containing structures from both runs, with their provenance recorded in the `origin` table (`source='smart'` or `'nosmart'`).  
+	•	clustered_cases.db → SMART run
+	•	clustered_cases_no_smart.db → NOSMART run
+	•	clustered_cases_combined.db → merged output 
 
 
 2. Populate per-case discovery data
