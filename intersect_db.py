@@ -1,3 +1,14 @@
+# examples of how to run this script.
+
+# generate intersection results for an energy window of 25 kJ/mol
+# python intersect_db.py clustered_cases_control_combined.db --mode coverage_curve --max-epoch 88 --step 10 --energy-window 25
+
+# show number of structures for an energy window of 25 kJ/mol
+# python intersect_db.py clustered_cases_control_combined.db --structures-vs-epoch --energy-window 25 --max-epoch 80 --step 10
+
+# show how many of the top N lowest-energy clusters (from the full run, from all origins) have been discovered at each epoch
+# python intersect_db.py clustered_cases_control_combined.db --top-n 500 --mode by_epoch --max-epoch 80 --step 10
+
 #!/usr/bin/env python3
 import argparse
 import matplotlib.pyplot as plt
@@ -80,8 +91,8 @@ filtered_reps AS (
   HAVING MIN(epoch_first_discovery) BETWEEN {int(epoch_min)} AND {int(epoch_max)}
 )
 """
-    elif mode == "coverage_curve":
-        # No filtering CTE; coverage curve is handled in main()
+    elif mode == "coverage_curve" or mode == "by_epoch":
+        # No filtering CTE; handled in main()
         return "", ""
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -112,11 +123,11 @@ def _coverage_joins(epoch_join, energy_join):
 
 
 def make_sql_counts(epoch_cte, epoch_join, energy_cte, energy_join):
-    with_prefix = _with_block(epoch_cte, energy_cte)
-    joins_clause = _coverage_joins(epoch_join, energy_join)
-
-    return f"""
-{with_prefix}
+    # Always include members and coverage as CTEs
+    ctes = [
+        epoch_cte,
+        energy_cte,
+        """
 members AS (
   -- all mapped members
   SELECT e.unique_id AS rep, c.id, COALESCE(o.source,'unknown') AS source
@@ -137,6 +148,15 @@ coverage AS (
   FROM members
   GROUP BY rep
 )
+""",
+    ]
+    # Remove empty CTEs
+    ctes = [c.strip() for c in ctes if c and c.strip()]
+    with_prefix = "WITH\n" + ",\n".join(ctes) + "\n"
+    joins_clause = _coverage_joins(epoch_join, energy_join)
+
+    return f"""
+{with_prefix}
 SELECT
   (SELECT COUNT(*) FROM crystal)                                      AS total_structs,
   (SELECT COUNT(*) FROM origin WHERE source='smart')                   AS n_smart,
@@ -156,6 +176,55 @@ SELECT
 
 
 def make_sql_struct_match_counts(epoch_cte, epoch_join, energy_cte, energy_join):
+    joins_clause = _coverage_joins(epoch_join, energy_join, coverage_alias="cv")
+
+    ctes = [
+        epoch_cte,
+        energy_cte,
+        f"""
+members AS (
+  SELECT e.unique_id AS rep, c.id, COALESCE(o.source,'unknown') AS source
+  FROM equivalent_to e
+  JOIN crystal      c ON c.id = e.equivalent_id
+  LEFT JOIN origin  o ON o.id = c.id
+  WHERE e.equivalent_id IS NOT NULL
+  UNION ALL
+  SELECT u.unique_id AS rep, u.unique_id AS id, COALESCE(o.source,'unknown') AS source
+  FROM (SELECT DISTINCT unique_id FROM equivalent_to) u
+  LEFT JOIN origin o ON o.id = u.unique_id
+),
+coverage AS (
+  SELECT rep,
+         MAX(CASE WHEN source IN ('smart','both')   THEN 1 ELSE 0 END) AS has_smart,
+         MAX(CASE WHEN source IN ('nosmart','both') THEN 1 ELSE 0 END) AS has_nosmart
+  FROM members
+  GROUP BY rep
+),
+members_filtered AS (
+  SELECT m.*
+  FROM members m
+  JOIN coverage cv ON cv.rep = m.rep
+  {joins_clause}
+)
+""",
+    ]
+    # Remove empty CTEs
+    ctes = [c.strip() for c in ctes if c and c.strip()]
+    with_prefix = "WITH\n" + ",\n".join(ctes) + "\n"
+
+    return f"""
+{with_prefix}
+SELECT
+  SUM(CASE WHEN m.source IN ('smart','both')   THEN 1 ELSE 0 END)                       AS smart_total,
+  SUM(CASE WHEN m.source IN ('smart','both')   AND cv.has_nosmart=1 THEN 1 ELSE 0 END)  AS smart_matched_in_nosmart,
+  SUM(CASE WHEN m.source IN ('nosmart','both') THEN 1 ELSE 0 END)                       AS nosmart_total,
+  SUM(CASE WHEN m.source IN ('nosmart','both') AND cv.has_smart=1 THEN 1 ELSE 0 END)    AS nosmart_matched_in_smart
+FROM members_filtered m
+JOIN coverage cv ON cv.rep = m.rep;
+"""
+
+
+def make_sql_struct_match_counts0(epoch_cte, epoch_join, energy_cte, energy_join):
     with_prefix = _with_block(epoch_cte, energy_cte)
     joins_clause = _coverage_joins(epoch_join, energy_join)
 
@@ -243,7 +312,69 @@ WHERE cr.energy IS NOT NULL AND cr.density IS NOT NULL;
 
 
 def pct(x, n):
-    return f"{(100.0*x/n):.2f}%" if n else "n/a"
+    return f"{(100.0 * x / n):.2f}%" if n else "n/a"
+
+
+# Add this function to intersect_db.py
+
+
+def structures_vs_epoch(db, acd_table, max_epoch=200, step=10, energy_window=None):
+    """
+    For each epoch, print the total number of structures found by SMART up to that epoch,
+    and the total number of structures found by NOSMART (within the energy window).
+    """
+    # Compute energy cutoff if needed
+    energy_cutoff = None
+    if energy_window is not None:
+        min_e = db.query(
+            "SELECT MIN(energy) FROM crystal WHERE energy IS NOT NULL"
+        ).fetchone()[0]
+        energy_cutoff = min_e + float(energy_window)
+
+    # Print energy window info if used
+    if energy_window is not None:
+        print(f"Energy window: Emin + {energy_window:g}")
+
+    print("Epoch\tSMART_structures\tNOSMART_structures")
+    epochs = [1] + list(range(step, max_epoch + 1, step))
+
+    for epoch in epochs:
+        # SMART structures up to this epoch, in energy window
+        sql_smart = f"""
+            SELECT DISTINCT c.id
+            FROM crystal c
+            JOIN origin o ON o.id = c.id
+            JOIN {acd_table} acd ON acd.unique_id = c.id
+            WHERE o.source IN ('smart','both')
+            AND acd.epoch_first_discovery <= {epoch}
+        """
+        if energy_cutoff is not None:
+            sql_smart += f" AND c.energy <= {energy_cutoff}"
+
+        smart_ids = {r[0] for r in db.query(sql_smart).fetchall()}
+
+        # NOSMART structures in energy window (not epoch-dependent)
+        sql_nosmart = """
+            SELECT c.id
+            FROM crystal c
+            JOIN origin o ON o.id = c.id
+            WHERE o.source IN ('nosmart','both')
+        """
+        if energy_cutoff is not None:
+            sql_nosmart += f" AND c.energy <= {energy_cutoff}"
+
+        nosmart_ids = {r[0] for r in db.query(sql_nosmart).fetchall()}
+
+        print(f"{epoch}\t{len(smart_ids)}\t{len(nosmart_ids)}")
+
+
+def _coverage_joins(epoch_join, energy_join, coverage_alias="coverage"):
+    joins = []
+    if epoch_join:
+        joins.append(epoch_join.replace("coverage.", f"{coverage_alias}."))
+    if energy_join:
+        joins.append(energy_join.replace("coverage.", f"{coverage_alias}."))
+    return ("\n  " + "\n  ".join(joins)) if joins else ""
 
 
 def coverage_vs_epoch(db, acd_table, max_epoch=200, step=5, energy_window=None):
@@ -309,8 +440,11 @@ def coverage_vs_epoch(db, acd_table, max_epoch=200, step=5, energy_window=None):
     print()
 
     # ---- Epoch sweep ----
+
     results = []
-    for epoch in range(step, max_epoch + 1, step):
+    # Always include epoch 1
+    epochs = [1] + list(range(step, max_epoch + 1, step))
+    for epoch in epochs:
         sql_map = f"""
             SELECT DISTINCT COALESCE(et.unique_id, et2.unique_id) AS glob_rep
             FROM {acd_table} acd
@@ -481,6 +615,133 @@ SELECT
     print()
 
 
+def structure_coverage_of_top_n_unique_clusters(db, n):
+    """
+    For the top N unique clusters (lowest-energy unique_id in equivalent_to), count
+    how many structures (crystal.id) in those clusters are from SMART, NOSMART, BOTH, or unknown.
+    """
+    # 1. Get the N lowest-energy unique_ids (cluster representatives)
+    sql = f"""
+        SELECT et.unique_id
+        FROM equivalent_to et
+        JOIN crystal c ON c.id = et.unique_id
+        WHERE c.energy IS NOT NULL
+        GROUP BY et.unique_id
+        ORDER BY c.energy ASC
+        LIMIT {n}
+    """
+    reps = [row[0] for row in db.query(sql).fetchall()]
+
+    # 2. For each cluster, get all member structures (including the rep itself)
+    smart_structures = set()
+    nosmart_structures = set()
+    both_structures = set()
+    unknown_structures = set()
+
+    for rep in reps:
+        for sid, source in db.query(
+            """
+            SELECT ids.id, COALESCE(o.source, 'unknown')
+            FROM (
+              SELECT e.equivalent_id AS id
+              FROM equivalent_to e
+              WHERE e.unique_id = ?
+              UNION
+              SELECT ? AS id
+            ) ids
+            LEFT JOIN origin o ON o.id = ids.id
+            """,
+            (rep, rep),
+        ):
+            if source == "smart":
+                smart_structures.add(sid)
+            elif source == "nosmart":
+                nosmart_structures.add(sid)
+            elif source == "both":
+                both_structures.add(sid)
+            else:
+                unknown_structures.add(sid)
+
+    # If you want to count "both" as both smart and nosmart, add them to both sets:
+    smart_structures |= both_structures
+    nosmart_structures |= both_structures
+
+    print(f"# Structure coverage in top {n} lowest-energy unique clusters")
+    print("------------------------------------------------------------")
+    print(f"SMART structures   : {len(smart_structures)}")
+    print(f"NOSMART structures : {len(nosmart_structures)}")
+    print(f"unknown structures : {len(unknown_structures)}")
+    print()
+
+
+def coverage_of_top_n_unique_clusters_vs_epoch(db, acd_table, n, max_epoch=80, step=10):
+    """
+    For the top N unique clusters (lowest-energy unique_id in equivalent_to, over the whole run),
+    for each epoch, count how many structures in those clusters have been discovered by that epoch,
+    broken down by SMART/NOSMART/unknown.
+    """
+    # 1. Get the N lowest-energy unique_ids (cluster representatives) from the full run
+    sql = f"""
+        SELECT et.unique_id
+        FROM equivalent_to et
+        JOIN crystal c ON c.id = et.unique_id
+        WHERE c.energy IS NOT NULL
+        GROUP BY et.unique_id
+        ORDER BY c.energy ASC
+        LIMIT {n}
+    """
+    reps = [row[0] for row in db.query(sql).fetchall()]
+
+    print("-------------------------------------------")
+    print(f"# Top {n} lowest-energy unique clusters (from the full run):")
+    print("-------------------------------------------")
+    print("Epoch\tSMART_structures\tNOSMART_structures\tunknown_structures")
+
+    epochs = [1] + list(range(step, max_epoch + 1, step))
+    for epoch in epochs:
+        smart_structures = set()
+        nosmart_structures = set()
+        both_structures = set()
+        unknown_structures = set()
+
+        for rep in reps:
+            for sid, source, disc_epoch in db.query(
+                f"""
+                SELECT ids.id, COALESCE(o.source, 'unknown'), acd.epoch_first_discovery
+                FROM (
+                  SELECT e.equivalent_id AS id
+                  FROM equivalent_to e
+                  WHERE e.unique_id = ?
+                  UNION
+                  SELECT ? AS id
+                ) ids
+                LEFT JOIN origin o ON o.id = ids.id
+                LEFT JOIN {acd_table} acd ON acd.unique_id = ids.id
+                """,
+                (rep, rep),
+            ):
+                if sid is None:
+                    continue  # skip nulls
+                if disc_epoch is not None and disc_epoch > epoch:
+                    continue  # not discovered yet at this epoch
+                if source == "smart":
+                    smart_structures.add(sid)
+                elif source == "nosmart":
+                    nosmart_structures.add(sid)
+                elif source == "both":
+                    both_structures.add(sid)
+                else:
+                    unknown_structures.add(sid)
+
+        # Count "both" as both smart and nosmart
+        smart_structures |= both_structures
+        nosmart_structures |= both_structures
+
+        print(
+            f"{epoch}\t{len(smart_structures)}\t{len(nosmart_structures)}\t{len(unknown_structures)}"
+        )
+
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -494,6 +755,11 @@ def main():
         "db", help="Path to combined SQLite DB (with origin + equivalent_to populated)"
     )
     ap.add_argument(
+        "--top-n",
+        type=int,
+        help="Compare coverage of the top N lowest-energy structures in the combined DB.",
+    )
+    ap.add_argument(
         "--acd-table",
         default="all_class_discovery",
         help="Aggregated discovery table name (default: all_class_discovery)",
@@ -502,9 +768,10 @@ def main():
     # Epoch filter knobs for standard reports / scatter
     ap.add_argument(
         "--mode",
-        choices=["discovered_by", "first_at", "range", "coverage_curve"],
+        choices=["discovered_by", "first_at", "range", "coverage_curve", "by_epoch"],
         help="Filter clusters by earliest discovery epoch across ANY case",
     )
+
     ap.add_argument(
         "--epoch", type=int, help="Epoch value for modes discovered_by / first_at"
     )
@@ -544,7 +811,27 @@ def main():
         action="store_true",
         help="Also make an energy–density scatter plot",
     )
+
+    ap.add_argument(
+        "--structures-vs-epoch",
+        action="store_true",
+        help="Print total number of structures found by SMART (by epoch) and NOSMART (in energy window).",
+    )
     args = ap.parse_args()
+
+    db = CspDataStore(args.db)
+
+    # ---- EARLY RETURN for structures-vs-epoch mode ----
+    if args.structures_vs_epoch:
+        structures_vs_epoch(
+            db,
+            args.acd_table,
+            max_epoch=args.max_epoch,
+            step=args.step,
+            energy_window=args.energy_window,
+        )
+        db.close()
+        return
 
     # Build filters
     try:
@@ -552,10 +839,9 @@ def main():
             args.mode, args.epoch, args.epoch_min, args.epoch_max, args.acd_table
         )
     except ValueError as e:
+        db.close()
         raise SystemExit(str(e))
     energy_cte, energy_join = build_energy_filter_cte(args.energy_window)
-
-    db = CspDataStore(args.db)
 
     # ---- SMART-by-epoch (A(E) vs B) using global reps (with optional energy filter) ----
     if args.smart_by_epoch is not None:
@@ -780,6 +1066,13 @@ def main():
             print("Wrote scatter: energy_density_overlap.png")
         else:
             print("No points matched the filters; skipping scatter.")
+
+    if args.top_n is not None and args.mode == "by_epoch":
+        coverage_of_top_n_unique_clusters_vs_epoch(
+            db, args.acd_table, args.top_n, max_epoch=args.max_epoch, step=args.step
+        )
+        db.close()
+        return
 
     db.close()
 
